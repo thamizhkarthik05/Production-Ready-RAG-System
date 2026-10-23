@@ -1,7 +1,9 @@
 
-"""In-memory FAISS vector store for semantic document retrieval."""
+"""Persistent-capable FAISS vector store for semantic retrieval."""
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import faiss
@@ -59,7 +61,6 @@ class VectorStore:
         if any(not isinstance(item, dict) for item in metadata):
             raise ValueError("Every metadata record must be a dictionary.")
 
-        # Copy so normalization does not mutate the caller's array.
         vectors = np.ascontiguousarray(vectors.copy())
         norms = np.linalg.norm(vectors, axis=1)
 
@@ -67,10 +68,86 @@ class VectorStore:
             raise ValueError("Embedding vectors must have non-zero norms.")
 
         faiss.normalize_L2(vectors)
-
-        # Store vectors and metadata in the same order.
         self._index.add(vectors)
         self._metadata.extend(dict(item) for item in metadata)
+
+    def save(self, index_path: str | Path) -> None:
+        """Persist the FAISS index and its aligned metadata."""
+        path = Path(index_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        metadata_path = path.with_suffix(path.suffix + ".json")
+        temporary_index = path.with_suffix(path.suffix + ".tmp")
+        temporary_metadata = metadata_path.with_suffix(
+            metadata_path.suffix + ".tmp"
+        )
+
+        try:
+            faiss.write_index(self._index, str(temporary_index))
+
+            with temporary_metadata.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "dimension": self.dimension,
+                        "metadata": self._metadata,
+                    },
+                    file,
+                    ensure_ascii=False,
+                )
+
+            # Replace destination files only after writing both temporary files.
+            temporary_index.replace(path)
+            temporary_metadata.replace(metadata_path)
+        finally:
+            temporary_index.unlink(missing_ok=True)
+            temporary_metadata.unlink(missing_ok=True)
+
+    @classmethod
+    def load(cls, index_path: str | Path) -> "VectorStore":
+        """Restore a saved FAISS index and its aligned metadata."""
+        path = Path(index_path)
+        metadata_path = path.with_suffix(path.suffix + ".json")
+
+        if not path.is_file() or not metadata_path.is_file():
+            raise FileNotFoundError(
+                "Both the FAISS index and metadata files must exist."
+            )
+
+        with metadata_path.open("r", encoding="utf-8") as file:
+            saved = json.load(file)
+
+        dimension = saved.get("dimension")
+        metadata = saved.get("metadata")
+
+        if (
+            not isinstance(dimension, int)
+            or isinstance(dimension, bool)
+            or dimension <= 0
+        ):
+            raise ValueError("Saved index has an invalid dimension.")
+
+        if not isinstance(metadata, list) or any(
+            not isinstance(item, dict) for item in metadata
+        ):
+            raise ValueError("Saved index has invalid metadata.")
+
+        index = faiss.read_index(str(path))
+
+        if index.d != dimension:
+            raise ValueError("FAISS index dimension does not match metadata.")
+
+        if index.ntotal != len(metadata):
+            raise ValueError(
+                "FAISS vector count does not match metadata count."
+            )
+
+        if not isinstance(index, faiss.IndexFlatIP):
+            raise ValueError("Saved FAISS index has an unsupported index type.")
+
+        store = cls(dimension=dimension)
+        store._index = index
+        store._metadata = metadata
+        return store
 
     def search(
         self,
@@ -106,10 +183,7 @@ class VectorStore:
         if self.size == 0:
             return []
 
-        # Search the full index before filtering so document-specific
-        # searches do not miss matches because of a small initial top_k.
         scores, indices = self._index.search(query, self.size)
-
         results: list[SearchResult] = []
 
         for score, index_position in zip(scores[0], indices[0]):

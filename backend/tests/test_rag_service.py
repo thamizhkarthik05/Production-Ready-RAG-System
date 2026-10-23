@@ -157,3 +157,129 @@ def test_rejects_empty_query(service):
 def test_rejects_invalid_top_k(service):
     with pytest.raises(ValueError, match="top_k"):
         service.search("Python", top_k=0)
+
+
+def test_indexed_document_survives_service_recreation(tmp_path):
+    from app.storage import SQLiteStorage
+
+    database = SQLiteStorage(tmp_path / "rag.db")
+    index_path = tmp_path / "faiss.index"
+
+    first_service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+
+    first_service.index_chunks(
+        [
+            make_chunk(
+                "persistent-doc",
+                "persistent-chunk",
+                "Python programming",
+            )
+        ]
+    )
+
+    second_service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+    second_service.load_persisted_data()
+
+    results = second_service.search("Python")
+
+    assert second_service.indexed_document_count == 1
+    assert second_service.indexed_chunk_count == 1
+    assert results[0].metadata["chunk_id"] == "persistent-chunk"
+    assert results[0].metadata["text"] == "Python programming"
+
+
+def test_service_rebuilds_missing_faiss_index_from_sqlite(tmp_path):
+    from app.storage import SQLiteStorage
+
+    database = SQLiteStorage(tmp_path / "rag.db")
+    index_path = tmp_path / "faiss.index"
+
+    first_service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+    first_service.index_chunks(
+        [make_chunk("doc-1", "chunk-1", "Python programming")]
+    )
+
+    # Simulate loss of the FAISS files while SQLite remains available.
+    index_path.unlink()
+    index_path.with_suffix(".index.json").unlink()
+
+    restored_service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+    restored_service.load_persisted_data()
+
+    results = restored_service.search("Python")
+
+    assert len(results) == 1
+    assert results[0].metadata["chunk_id"] == "chunk-1"
+    assert index_path.exists()
+
+
+
+
+def test_delete_document_removes_its_chunks_from_search(service):
+    service.index_chunks(
+        [make_chunk("doc-1", "chunk-1", "Python programming")]
+    )
+    service.index_chunks(
+        [make_chunk("doc-2", "chunk-2", "Database systems")]
+    )
+
+    assert service.delete_document("doc-1") is True
+    assert service.indexed_document_count == 1
+    assert service.indexed_chunk_count == 1
+
+    results = service.search("Python")
+
+    assert all(
+        result.metadata["document_id"] != "doc-1"
+        for result in results
+    )
+
+
+def test_delete_missing_document_returns_false(service):
+    assert service.delete_document("missing-doc") is False
+
+
+def test_delete_document_persists_removal(tmp_path):
+    from app.storage import SQLiteStorage
+
+    database = SQLiteStorage(tmp_path / "delete.db")
+    index_path = tmp_path / "faiss.index"
+
+    service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+    service.index_chunks(
+        [make_chunk("doc-1", "chunk-1", "Python programming")]
+    )
+
+    assert service.delete_document("doc-1") is True
+    assert database.list_documents() == []
+
+    restored_service = RAGService(
+        embedding_service=FakeEmbeddingService(),
+        storage_backend=database,
+        index_path=index_path,
+    )
+    restored_service.load_persisted_data()
+
+    assert restored_service.indexed_document_count == 0
+    assert restored_service.indexed_chunk_count == 0
+    assert restored_service.search("Python") == []

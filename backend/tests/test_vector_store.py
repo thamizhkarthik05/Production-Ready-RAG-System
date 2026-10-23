@@ -169,3 +169,68 @@ def test_add_empty_batch_does_not_change_store():
 def test_invalid_dimension_is_rejected():
     with pytest.raises(ValueError, match="positive integer"):
         VectorStore(dimension=0)
+
+
+def test_save_and_load_preserves_search_results(tmp_path):
+    import numpy as np
+
+    from app.vector_store import VectorStore
+
+    store = VectorStore(dimension=3)
+    embeddings = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    metadata = [
+        {"document_id": "doc-1", "chunk_id": "chunk-1"},
+        {"document_id": "doc-2", "chunk_id": "chunk-2"},
+    ]
+    store.add(embeddings, metadata)
+
+    index_path = tmp_path / "test.index"
+    store.save(index_path)
+    restored = VectorStore.load(index_path)
+
+    assert restored.size == 2
+
+    results = restored.search(
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        top_k=2,
+    )
+
+    assert results[0].metadata["chunk_id"] == "chunk-1"
+    assert results[0].score == pytest.approx(1.0)
+    assert results[1].metadata["chunk_id"] == "chunk-2"
+
+
+def test_load_rejects_missing_persistence_files(tmp_path):
+    from app.vector_store import VectorStore
+
+    with pytest.raises(FileNotFoundError):
+        VectorStore.load(tmp_path / "missing.index")
+
+
+def test_load_rejects_mismatched_metadata_count(tmp_path):
+    import json
+
+    import faiss
+
+    from app.vector_store import VectorStore
+
+    index_path = tmp_path / "broken.index"
+    index = faiss.IndexFlatIP(3)
+    index.add(np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    faiss.write_index(index, str(index_path))
+
+    metadata_path = index_path.with_suffix(".index.json")
+    metadata_path.write_text(
+        json.dumps({"dimension": 3, "metadata": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="vector count"):
+        VectorStore.load(index_path)
+

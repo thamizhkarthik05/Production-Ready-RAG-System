@@ -9,6 +9,7 @@ from app.document_processor import (
     process_document,
 )
 from app.rag_service import rag_service
+from app.storage import storage
 
 
 logger = logging.getLogger(__name__)
@@ -19,18 +20,36 @@ router = APIRouter(
 )
 
 
+@router.get("/", status_code=status.HTTP_200_OK)
+async def list_documents():
+    """Return all documents stored in the database."""
+    try:
+        documents = storage.list_documents()
+
+        return {
+            "document_count": len(documents),
+            "documents": documents,
+        }
+
+    except Exception as exc:
+        logger.exception("Failed to list documents")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not retrieve documents.",
+        ) from exc
+
+
 @router.post("/upload", status_code=status.HTTP_200_OK)
 async def upload_document(file: UploadFile = File(...)):
     filename = file.filename or ""
 
-    # Read at most one byte beyond the limit so oversized uploads
-    # can be rejected without loading the entire file into memory.
+    # Read at most one byte beyond the limit.
     content = await file.read(MAX_FILE_SIZE_BYTES + 1)
     await file.close()
 
     if len(content) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="File exceeds the 10 MB upload limit.",
         )
 
@@ -54,7 +73,7 @@ async def upload_document(file: UploadFile = File(...)):
             ) from exc
 
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=message,
         ) from exc
 
@@ -95,3 +114,34 @@ async def upload_document(file: UploadFile = File(...)):
             for chunk in chunks
         ],
     }
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_200_OK)
+async def delete_document(document_id: str):
+    """Delete a document from persistent storage and the search index."""
+    try:
+        deleted = rag_service.delete_document(document_id)
+
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document '{document_id}' was not found.",
+            )
+
+        return {
+            "message": "Document deleted successfully.",
+            "document_id": document_id,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete document %s",
+            document_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not delete the document.",
+        ) from exc

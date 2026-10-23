@@ -1,12 +1,17 @@
-from app.routes.documents import router as documents_router
+
 import logging
 from contextlib import asynccontextmanager
-from app.routes import search
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes.ask import router as ask_router
+
 from app.config import get_settings
 from app.logging_config import configure_logging
+from app.rag_service import rag_service
+from app.routes import search
+from app.routes.ask import router as ask_router
+from app.routes.documents import router as documents_router
+
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -17,7 +22,21 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting %s", settings.app_name)
+
+    # Restore persisted documents and the FAISS index before serving requests.
+    try:
+        rag_service.load_persisted_data()
+        logger.info(
+            "Restored %s documents and %s chunks",
+            rag_service.indexed_document_count,
+            rag_service.indexed_chunk_count,
+        )
+    except Exception:
+        logger.exception("Failed to restore persisted RAG data")
+        raise
+
     yield
+
     logger.info("Shutting down %s", settings.app_name)
 
 
